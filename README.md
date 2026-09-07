@@ -6,7 +6,7 @@ Ubuntu 24.04 服务器网络综合检测与测速工具。
 
 ## 版本
 
-**Current Version: v2.1.0**
+**Current Version: v2.2.0**
 
 **适用系统：Ubuntu 24.04 LTS**
 
