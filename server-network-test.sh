@@ -2,17 +2,22 @@
 
 # ============================================================
 # network_test.sh
-# Version: 2.1.0
+# Version: 2.2.0
 # Ubuntu 24.04
 #
-# 网络 / 三网回程 / 多节点测速 / 3路峰值 /
+# 网络 / 三网回程 / 多节点测速 / 并发峰值 /
 # DNS / TCP / HTTPS / TLS / MTR / MTU /
-# IP网络层风险综合检测
+# Target IP / IP网络层风险综合检测
+#
+# 注意：
+# 1. 三路并发 != 中国电信/联通/移动三条物理线路
+# 2. Target IP TCP端口失败不代表IP不可达
+# 3. 平台账号注册风控无法仅通过网络测试准确判断
 # ============================================================
 
 set -u
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 SCRIPT_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
 BASE_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)"
@@ -32,6 +37,7 @@ PUBLIC_IPV6=""
 LOCAL_IPV4=""
 DEFAULT_IF=""
 DEFAULT_GW=""
+DNS_SERVER=""
 
 DNS_FAIL=0
 PING_FAIL=0
@@ -45,6 +51,15 @@ TOR_EXIT="UNKNOWN"
 NETWORK_SCORE=100
 RISK_LEVEL="未知"
 
+CLOUDFLARE_SPEED="N/A"
+OVH_SPEED="N/A"
+MAX_PARALLEL_SPEED="N/A"
+
+REPORT_TXT=""
+REPORT_JSON=""
+REPORT_TIME=""
+START_TIME=""
+
 # ============================================================
 # 三网目标
 # ============================================================
@@ -57,7 +72,7 @@ CM_IP="211.136.17.107"
 # 测速地址
 # ============================================================
 
-CLOUDFLARE_URL="https://speed.cloudflare.com/__down?bytes=100000000"
+CLOUDFLARE_URL="https://speed.cloudflare.com/__down?bytes=50000000"
 OVH_URL="https://proof.ovh.net/files/100Mb.dat"
 
 # ============================================================
@@ -70,6 +85,12 @@ DOMAINS=(
     "www.facebook.com"
     "www.tiktok.com"
 )
+
+# ============================================================
+# 并发测速级别
+# ============================================================
+
+PARALLEL_LEVELS=(1 3 5 10)
 
 # ============================================================
 # 颜色
@@ -109,12 +130,14 @@ section() {
     echo "============================================================"
 
     if [[ -n "${REPORT_TXT:-}" ]]; then
+
         {
             echo
             echo "============================================================"
             echo "$1"
             echo "============================================================"
         } >> "$REPORT_TXT" 2>/dev/null || true
+
     fi
 }
 
@@ -124,21 +147,27 @@ log() {
     shift
 
     case "$level" in
+
         OK)
             echo -e "${GREEN}[ OK ]${NC} $*"
             ;;
+
         WARN)
             echo -e "${YELLOW}[WARN]${NC} $*"
             ;;
+
         ERROR)
             echo -e "${RED}[ERROR]${NC} $*"
             ;;
+
         INFO)
             echo -e "${BLUE}[INFO]${NC} $*"
             ;;
+
         *)
             echo "$*"
             ;;
+
     esac
 
     if [[ -n "${REPORT_TXT:-}" ]]; then
@@ -150,6 +179,22 @@ pause_screen() {
 
     echo
     read -rp "按 Enter 返回菜单..." _
+}
+
+# ============================================================
+# IP格式验证
+# ============================================================
+
+valid_ipv4() {
+
+    local ip="$1"
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+
+    local IFS=.
+    read -r a b c d <<< "$ip"
+
+    ((a <= 255 && b <= 255 && c <= 255 && d <= 255))
 }
 
 # ============================================================
@@ -165,6 +210,7 @@ check_root() {
         if command -v sudo >/dev/null 2>&1; then
 
             echo "尝试使用 sudo..."
+
             exec sudo bash "$SCRIPT_PATH"
 
         else
@@ -173,7 +219,6 @@ check_root() {
             exit 1
 
         fi
-
     fi
 }
 
@@ -199,8 +244,10 @@ install_dependencies() {
     command -v nc >/dev/null 2>&1 || packages+=("netcat-openbsd")
 
     if [[ ${#packages[@]} -eq 0 ]]; then
+
         log OK "依赖完整，无需安装"
         return 0
+
     fi
 
     echo
@@ -210,8 +257,10 @@ install_dependencies() {
     read -rp "是否自动安装？[Y/n]：" answer
 
     if [[ "$answer" =~ ^[Nn]$ ]]; then
+
         log WARN "跳过依赖安装"
         return 0
+
     fi
 
     export DEBIAN_FRONTEND=noninteractive
@@ -219,9 +268,13 @@ install_dependencies() {
     apt-get update -qq
 
     if apt-get install -y "${packages[@]}"; then
+
         log OK "依赖安装完成"
+
     else
+
         log ERROR "依赖安装失败"
+
     fi
 }
 
@@ -266,12 +319,14 @@ get_public_ip() {
 
     for api in "${apis[@]}"; do
 
-        PUBLIC_IPV4="$(curl -4 -fsS \
-            --max-time 8 \
-            "$api" 2>/dev/null |
-            tr -d '[:space:]')"
+        PUBLIC_IPV4="$(
+            curl -4 -fsS \
+                --max-time 8 \
+                "$api" 2>/dev/null |
+            tr -d '[:space:]'
+        )"
 
-        if [[ "$PUBLIC_IPV4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        if valid_ipv4 "$PUBLIC_IPV4"; then
             break
         fi
 
@@ -280,24 +335,34 @@ get_public_ip() {
     done
 
     if [[ -n "$PUBLIC_IPV4" ]]; then
+
         log OK "公网 IPv4：$PUBLIC_IPV4"
+
     else
+
         log ERROR "无法获取公网 IPv4"
+
     fi
 
     PUBLIC_IPV6=""
 
-    PUBLIC_IPV6="$(curl -6 -fsS \
-        --max-time 8 \
-        https://api64.ipify.org \
-        2>/dev/null |
-        tr -d '[:space:]')" || true
+    PUBLIC_IPV6="$(
+        curl -6 -fsS \
+            --max-time 8 \
+            https://api64.ipify.org \
+            2>/dev/null |
+        tr -d '[:space:]'
+    )" || true
 
     if [[ "$PUBLIC_IPV6" == *:* ]]; then
+
         log OK "公网 IPv6：$PUBLIC_IPV6"
+
     else
+
         log WARN "没有检测到公网 IPv6"
         PUBLIC_IPV6=""
+
     fi
 }
 
@@ -326,15 +391,84 @@ network_info() {
         awk '/default/ {print $3; exit}'
     )"
 
+    DNS_SERVER="$(
+        resolvectl dns 2>/dev/null |
+        awk 'NF>1 {print $2}' |
+        head -1
+    )"
+
+    if [[ -z "$DNS_SERVER" ]]; then
+
+        DNS_SERVER="$(
+            grep '^nameserver' /etc/resolv.conf 2>/dev/null |
+            head -1 |
+            awk '{print $2}'
+        )"
+
+    fi
+
     echo "本地 IPv4：${LOCAL_IPV4:-未知}"
     echo "默认网卡：${DEFAULT_IF:-未知}"
     echo "默认网关：${DEFAULT_GW:-未知}"
+    echo "DNS服务器：${DNS_SERVER:-未知}"
 
     {
         echo "本地 IPv4：${LOCAL_IPV4:-未知}"
         echo "默认网卡：${DEFAULT_IF:-未知}"
         echo "默认网关：${DEFAULT_GW:-未知}"
+        echo "DNS服务器：${DNS_SERVER:-未知}"
     } >> "$REPORT_TXT"
+}
+
+# ============================================================
+# Target IP输入
+# ============================================================
+
+input_target_ip() {
+
+    while true; do
+
+        echo
+        echo "============================================================"
+        echo "目标 IP 设置"
+        echo "============================================================"
+        echo
+        echo "当前目标 IP：${TARGET_IP:-未设置}"
+        echo
+        echo "请输入目标 IPv4。"
+        echo "例如：183.23.226.212"
+        echo
+        echo "输入 0 返回菜单"
+        echo
+
+        read -rp "目标 IP： " input
+
+        if [[ "$input" == "0" ]]; then
+            return 1
+        fi
+
+        if valid_ipv4 "$input"; then
+
+            TARGET_IP="$input"
+
+            echo
+            echo "目标 IP 已设置：$TARGET_IP"
+            echo
+
+            read -rp "确认开始测试？[Y/n]：" confirm
+
+            if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
+                return 0
+            fi
+
+        else
+
+            echo
+            echo -e "${RED}IP 地址格式错误。${NC}"
+
+        fi
+
+    done
 }
 
 # ============================================================
@@ -360,28 +494,24 @@ dns_test() {
         local result
 
         result="$(
-            dig +short "$domain" 2>/dev/null |
+            dig +time=3 +tries=1 +short "$domain" 2>/dev/null |
             head -1
         )"
 
         if [[ -n "$result" ]]; then
+
             log OK "$domain -> $result"
+
         else
+
             log WARN "$domain -> DNS FAIL"
             ((DNS_FAIL++))
+
         fi
 
     done
 
-    local resolver
-
-    resolver="$(
-        grep '^nameserver' /etc/resolv.conf 2>/dev/null |
-        head -1 |
-        awk '{print $2}'
-    )"
-
-    echo "DNS服务器：${resolver:-未知}" >> "$REPORT_TXT"
+    echo "DNS服务器：${DNS_SERVER:-未知}" >> "$REPORT_TXT"
 }
 
 # ============================================================
@@ -399,8 +529,9 @@ ping_test() {
         "Google DNS:8.8.8.8"
     )
 
-    [[ -n "$TARGET_IP" ]] &&
+    if [[ -n "$TARGET_IP" ]]; then
         targets+=("目标 IP:$TARGET_IP")
+    fi
 
     for item in "${targets[@]}"; do
 
@@ -417,14 +548,17 @@ ping_test() {
 
         if [[ -n "$result" ]]; then
 
-            local loss
-            loss="${result%%% packet loss}"
+            local loss="${result%%% packet loss}"
 
             if [[ "$loss" == "0" ]]; then
+
                 log OK "$name：${loss}% 丢包"
+
             else
+
                 log WARN "$name：${loss}% 丢包"
                 ((PING_FAIL++))
+
             fi
 
         else
@@ -454,13 +588,17 @@ tcp_test() {
         "www.tiktok.com:443"
     )
 
-    [[ -n "$TARGET_IP" ]] && tests+=(
-        "$TARGET_IP:22"
-        "$TARGET_IP:80"
-        "$TARGET_IP:443"
-        "$TARGET_IP:8080"
-        "$TARGET_IP:8443"
-    )
+    if [[ -n "$TARGET_IP" ]]; then
+
+        tests+=(
+            "$TARGET_IP:22"
+            "$TARGET_IP:80"
+            "$TARGET_IP:443"
+            "$TARGET_IP:8080"
+            "$TARGET_IP:8443"
+        )
+
+    fi
 
     for item in "${tests[@]}"; do
 
@@ -484,7 +622,7 @@ tcp_test() {
 
         else
 
-            log WARN "$host:$port FAIL"
+            log WARN "$host:$port CLOSED/FILTERED"
             ((TCP_FAIL++))
 
         fi
@@ -504,11 +642,10 @@ https_test() {
 
     for domain in "${DOMAINS[@]}"; do
 
+        local result
         local code
         local connect
         local total
-
-        local result
 
         result="$(
             curl -4 \
@@ -526,13 +663,13 @@ https_test() {
         connect="$(echo "$result" | cut -d'|' -f2)"
         total="$(echo "$result" | cut -d'|' -f3)"
 
-        if [[ "$code" =~ ^2|^3 ]]; then
+        if [[ "$code" =~ ^(2|3)[0-9][0-9]$ ]]; then
 
             log OK "$domain：HTTPS $code / Connect ${connect}s / Total ${total}s"
 
         else
 
-            log WARN "$domain：HTTPS $code"
+            log WARN "$domain：HTTPS ${code:-FAIL}"
             ((HTTPS_FAIL++))
 
         fi
@@ -552,18 +689,32 @@ tls_test() {
 
     for domain in "${DOMAINS[@]}"; do
 
-        if timeout "$TIMEOUT" \
-            openssl s_client \
-            -connect "$domain:443" \
-            -servername "$domain" \
-            </dev/null 2>/dev/null |
+        local output
+
+        output="$(
+            timeout "$TIMEOUT" \
+                openssl s_client \
+                -connect "$domain:443" \
+                -servername "$domain" \
+                -brief \
+                </dev/null \
+                2>&1 || true
+        )"
+
+        if echo "$output" |
+            grep -Eq "Protocol version|Verification: OK|Peer certificate"; then
+
+            log OK "$domain TLS / SNI 正常"
+
+        elif echo "$output" |
             grep -q "BEGIN CERTIFICATE"; then
 
             log OK "$domain TLS / SNI 正常"
 
         else
 
-            log WARN "$domain TLS FAIL"
+            warn_text="TLS握手失败"
+            log WARN "$domain $warn_text"
             ((TLS_FAIL++))
 
         fi
@@ -572,7 +723,7 @@ tls_test() {
 }
 
 # ============================================================
-# 延迟
+# 平均延迟
 # ============================================================
 
 latency_test() {
@@ -584,8 +735,9 @@ latency_test() {
         "Google DNS:8.8.8.8"
     )
 
-    [[ -n "$TARGET_IP" ]] &&
+    if [[ -n "$TARGET_IP" ]]; then
         targets+=("目标 IP:$TARGET_IP")
+    fi
 
     for item in "${targets[@]}"; do
 
@@ -600,9 +752,13 @@ latency_test() {
         )"
 
         if [[ -n "$avg" ]]; then
+
             log OK "$name：平均 RTT ${avg} ms"
+
         else
+
             log WARN "$name：无法获取 RTT"
+
         fi
 
     done
@@ -631,7 +787,8 @@ carrier_test_one() {
         -m 20 \
         "$ip" \
         2>/dev/null |
-        tee "$file"
+        tee "$file" |
+        tee -a "$REPORT_TXT"
 
     local avg
     local max
@@ -663,9 +820,8 @@ carrier_test_one() {
                 if($i=="ms"){
                     v=$(i-1)
                     gsub(/[^0-9.]/,"",v)
-                    if(v!=""){
-                        if(v>max) max=v
-                    }
+                    if(v!="" && v>max)
+                        max=v
                 }
             }
         }
@@ -724,8 +880,9 @@ mtr_test() {
         "中国移动:$CM_IP"
     )
 
-    [[ -n "$TARGET_IP" ]] &&
+    if [[ -n "$TARGET_IP" ]]; then
         targets+=("目标 IP:$TARGET_IP")
+    fi
 
     for item in "${targets[@]}"; do
 
@@ -768,7 +925,8 @@ mtu_test() {
 
     mtu="$(
         ip link show "$DEFAULT_IF" 2>/dev/null |
-        awk '/mtu/ {
+        awk '
+        /mtu/ {
             for(i=1;i<=NF;i++)
                 if($i=="mtu")
                     print $(i+1)
@@ -777,6 +935,11 @@ mtu_test() {
 
     echo "当前接口：${DEFAULT_IF:-未知}"
     echo "当前 MTU：${mtu:-未知}"
+
+    {
+        echo "当前接口：${DEFAULT_IF:-未知}"
+        echo "当前 MTU：${mtu:-未知}"
+    } >> "$REPORT_TXT"
 
     if ping -4 \
         -M do \
@@ -796,7 +959,7 @@ mtu_test() {
 }
 
 # ============================================================
-# 下载测速
+# 单节点下载测速
 # ============================================================
 
 speed_test_one() {
@@ -807,78 +970,153 @@ speed_test_one() {
     echo
     echo "---------- $name ----------"
 
-    local speed
+    local tmp
+    local start
+    local end
+    local elapsed
+    local bytes
+    local mbps
 
-    speed="$(
+    tmp="/tmp/network_speed_${name// /_}_$$"
+
+    start="$(date +%s%3N)"
+
+    if ! timeout 40 \
         curl \
             -L \
             -4 \
-            -o /dev/null \
             -sS \
             --connect-timeout 10 \
-            --max-time 30 \
-            -w '%{speed_download}' \
+            --max-time 40 \
+            -o "$tmp" \
             "$url" \
-            2>/dev/null || echo "0"
+            2>/dev/null; then
+
+        rm -f "$tmp"
+
+        log WARN "$name：测速失败"
+        return 1
+
+    fi
+
+    end="$(date +%s%3N)"
+
+    elapsed=$((end-start))
+
+    if [[ ! -s "$tmp" ]]; then
+
+        rm -f "$tmp"
+
+        log WARN "$name：没有下载到有效数据"
+        return 1
+
+    fi
+
+    bytes="$(
+        stat -c '%s' "$tmp" 2>/dev/null || echo 0
     )"
 
-    if [[ "$speed" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    rm -f "$tmp"
 
-        local mbps
+    if [[ "$bytes" -le 0 || "$elapsed" -le 0 ]]; then
 
-        mbps="$(
-            awk -v b="$speed" \
-            'BEGIN {printf "%.2f", b*8/1000000}'
-        )"
+        log WARN "$name：测速结果无效"
+        return 1
+
+    fi
+
+    mbps="$(
+        awk \
+            -v bytes="$bytes" \
+            -v ms="$elapsed" \
+            'BEGIN {
+                printf "%.2f",
+                (bytes * 8 / (ms / 1000)) / 1000000
+            }'
+    )"
+
+    if awk -v speed="$mbps" \
+        'BEGIN {exit !(speed > 0)}'; then
 
         log OK "$name：${mbps} Mbps"
 
-    else
+        echo "$name Speed=${mbps} Mbps" >> "$REPORT_TXT"
 
-        log WARN "$name：测速失败"
+        if [[ "$name" == "Cloudflare" ]]; then
+            CLOUDFLARE_SPEED="$mbps"
+        fi
+
+        if [[ "$name" == "OVH" ]]; then
+            OVH_SPEED="$mbps"
+        fi
+
+        return 0
 
     fi
+
+    log WARN "$name：测速结果无效"
+
+    return 1
 }
+
+# ============================================================
+# 公网测速
+# ============================================================
 
 speed_test() {
 
     section "公网多节点下载测速"
 
-    speed_test_one "Cloudflare" "$CLOUDFLARE_URL"
+    CLOUDFLARE_SPEED="N/A"
+    OVH_SPEED="N/A"
 
-    speed_test_one "OVH" "$OVH_URL"
+    speed_test_one \
+        "Cloudflare" \
+        "$CLOUDFLARE_URL" || true
+
+    speed_test_one \
+        "OVH" \
+        "$OVH_URL" || true
+
+    echo
+    echo "Cloudflare：${CLOUDFLARE_SPEED} Mbps"
+    echo "OVH：${OVH_SPEED} Mbps"
 }
 
 # ============================================================
-# 三路并发峰值
+# 单次并发测速
 # ============================================================
 
-parallel_speed_test() {
+parallel_speed_once() {
 
-    section "三路并发峰值测速"
+    local parallel="$1"
 
-    local tmpdir="/tmp/network_parallel_$$"
+    local tmpdir
+    local start
+    local end
+    local elapsed
+    local total_bytes
+    local speed
+    local success
 
+    tmpdir="/tmp/network_parallel_$$"
+
+    rm -rf "$tmpdir"
     mkdir -p "$tmpdir"
 
-    echo
-    echo "并发数量：$PARALLEL"
-    echo "测试时间：${DURATION} 秒"
-    echo
+    start="$(date +%s%3N)"
 
-    for i in $(seq 1 "$PARALLEL"); do
+    for ((i=1; i<=parallel; i++)); do
 
         (
             curl \
                 -L \
                 -4 \
-                -o /dev/null \
                 -sS \
                 --connect-timeout 10 \
-                --max-time "$DURATION" \
-                -w '%{speed_download}' \
+                --max-time "$((DURATION + 10))" \
+                -o "${tmpdir}/${i}.dat" \
                 "$CLOUDFLARE_URL" \
-                > "${tmpdir}/${i}.speed" \
                 2>/dev/null
         ) &
 
@@ -886,103 +1124,118 @@ parallel_speed_test() {
 
     wait
 
-    local total=0
-    local count=0
+    end="$(date +%s%3N)"
 
-    for file in "$tmpdir"/*.speed; do
+    elapsed=$((end-start))
 
-        [[ -f "$file" ]] || continue
+    total_bytes="$(
+        find "$tmpdir" \
+            -type f \
+            -printf '%s\n' 2>/dev/null |
+        awk '{sum+=$1} END{print sum+0}'
+    )"
 
-        local speed
+    success="$(
+        find "$tmpdir" \
+            -type f \
+            -size +0c \
+            2>/dev/null |
+        wc -l
+    )"
 
-        speed="$(cat "$file" 2>/dev/null)"
+    rm -rf "$tmpdir"
 
-        if [[ "$speed" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    if [[ "$success" -eq 0 ||
+          "$total_bytes" -le 0 ||
+          "$elapsed" -le 0 ]]; then
 
-            total="$(
-                awk \
-                -v a="$total" \
-                -v b="$speed" \
-                'BEGIN {print a+b}'
-            )"
+        log WARN "${parallel} 路并发：测速失败"
 
-            ((count++))
+        return 1
+    fi
+
+    speed="$(
+        awk \
+            -v bytes="$total_bytes" \
+            -v ms="$elapsed" \
+            'BEGIN {
+                printf "%.2f",
+                (bytes * 8 / (ms / 1000)) / 1000000
+            }'
+    )"
+
+    if awk -v speed="$speed" \
+        'BEGIN {exit !(speed > 0)}'; then
+
+        log OK "${parallel} 路并发：${speed} Mbps（${success} 路有效）"
+
+        echo "Parallel_${parallel}=${speed} Mbps" >> "$REPORT_TXT"
+
+        echo "$speed"
+
+        return 0
+    fi
+
+    log WARN "${parallel} 路并发：结果无效"
+
+    return 1
+}
+
+# ============================================================
+# 并发峰值
+# ============================================================
+
+parallel_speed_test() {
+
+    section "并发峰值测速"
+
+    echo
+    echo "测速时间：${DURATION} 秒"
+    echo "测试级别：1 / 3 / 5 / 10 路"
+    echo
+
+    MAX_PARALLEL_SPEED="N/A"
+
+    local max="0"
+    local result
+
+    for p in "${PARALLEL_LEVELS[@]}"; do
+
+        result="$(parallel_speed_once "$p" 2>/dev/null | tail -1)"
+
+        if [[ "$result" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+
+            if awk \
+                -v a="$result" \
+                -v b="$max" \
+                'BEGIN {exit !(a>b)}'; then
+
+                max="$result"
+
+            fi
 
         fi
 
     done
 
-    if [[ "$count" -gt 0 ]]; then
+    if awk -v speed="$max" \
+        'BEGIN {exit !(speed > 0)}'; then
 
-        local mbps
+        MAX_PARALLEL_SPEED="${max} Mbps"
 
-        mbps="$(
-            awk \
-            -v b="$total" \
-            'BEGIN {printf "%.2f", b*8/1000000}'
-        )"
-
-        log OK "${count} 路并发总峰值：${mbps} Mbps"
-
-        echo "三路并发峰值：${mbps} Mbps" >> "$REPORT_TXT"
+        echo
+        log OK "最高并发峰值：${max} Mbps"
 
     else
 
-        log WARN "三路并发测速失败"
+        log WARN "所有并发测速均失败"
 
     fi
-
-    rm -rf "$tmpdir"
 }
 
 # ============================================================
-# 目标 IP 测试
+# Target IP综合测试
 # ============================================================
-
-input_target_ip() {
-
-    while true; do
-
-        echo
-        echo "============================================================"
-        echo "目标 IP 测试"
-        echo "============================================================"
-        echo
-        echo "请输入目标 IPv4 地址。"
-        echo "例如：183.23.226.212"
-        echo
-        echo "输入 0 返回菜单"
-        echo
-
-        read -rp "目标 IP： " input
-
-        if [[ "$input" == "0" ]]; then
-            return 1
-        fi
-
-        if [[ "$input" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-
-            TARGET_IP="$input"
-
-            echo
-            echo "目标 IP：$TARGET_IP"
-            echo
-
-            read -rp "确认开始测试？[Y/n]：" confirm
-
-            if [[ ! "$confirm" =~ ^[Nn]$ ]]; then
-                return 0
-            fi
-
-        else
-
-            echo
-            echo -e "${RED}IP 地址格式错误。${NC}"
-
-        fi
-
-    done
-}
 
 target_test() {
 
@@ -1000,38 +1253,43 @@ target_test() {
     echo "Target IP：$TARGET_IP"
     echo
 
-    # -------------------------
+    # --------------------------------------------------------
     # Ping
-    # -------------------------
+    # --------------------------------------------------------
 
-    local loss
+    echo "---- Ping ----"
 
-    loss="$(
-        ping -c 4 -W 2 "$TARGET_IP" 2>/dev/null |
-        grep -oE '[0-9]+% packet loss' |
-        head -1
+    local ping_output
+
+    ping_output="$(
+        ping -c 10 -W 2 "$TARGET_IP" 2>/dev/null || true
     )"
 
-    if [[ "$loss" == "0% packet loss" ]]; then
-        log OK "目标 IP Ping：0% 丢包"
-    else
-        log WARN "目标 IP Ping：${loss:-FAIL}"
-    fi
+    echo "$ping_output" | tee -a "$REPORT_TXT"
 
-    # -------------------------
+    # --------------------------------------------------------
     # TCP
-    # -------------------------
+    # --------------------------------------------------------
 
     echo
-    echo "TCP 端口："
+    echo "---- TCP端口 ----"
 
     for port in 22 80 443 8080 8443; do
+
+        local start
+        local end
+        local ms
+
+        start="$(date +%s%3N)"
 
         if timeout "$TIMEOUT" \
             bash -c "</dev/tcp/$TARGET_IP/$port" \
             2>/dev/null; then
 
-            log OK "$TARGET_IP:$port OPEN"
+            end="$(date +%s%3N)"
+            ms=$((end-start))
+
+            log OK "$TARGET_IP:$port OPEN (${ms} ms)"
 
         else
 
@@ -1041,12 +1299,12 @@ target_test() {
 
     done
 
-    # -------------------------
-    # 路由
-    # -------------------------
+    # --------------------------------------------------------
+    # Traceroute
+    # --------------------------------------------------------
 
     echo
-    echo "Traceroute："
+    echo "---- Traceroute ----"
 
     traceroute \
         -n \
@@ -1057,12 +1315,12 @@ target_test() {
         2>/dev/null |
         tee -a "$REPORT_TXT"
 
-    # -------------------------
+    # --------------------------------------------------------
     # MTR
-    # -------------------------
+    # --------------------------------------------------------
 
     echo
-    echo "MTR："
+    echo "---- MTR ----"
 
     if command -v mtr >/dev/null 2>&1; then
 
@@ -1076,18 +1334,24 @@ target_test() {
             2>/dev/null |
             tee -a "$REPORT_TXT"
 
+    else
+
+        log WARN "MTR 未安装"
+
     fi
 }
 
 # ============================================================
-# IP 信息
+# IP ASN / ISP
 # ============================================================
 
 ip_info() {
 
     section "公网 IP / ASN / ISP 信息"
 
-    [[ -z "$PUBLIC_IPV4" ]] && return
+    if [[ -z "$PUBLIC_IPV4" ]]; then
+        return
+    fi
 
     local result=""
 
@@ -1185,7 +1449,9 @@ spamhaus_test() {
 
     section "Spamhaus DNSBL"
 
-    [[ -z "$PUBLIC_IPV4" ]] && return
+    if [[ -z "$PUBLIC_IPV4" ]]; then
+        return
+    fi
 
     local reversed
 
@@ -1197,7 +1463,7 @@ spamhaus_test() {
     if dig +short \
         "${reversed}.zen.spamhaus.org" \
         A 2>/dev/null |
-        grep -qE '127\.0\.0\.'; then
+        grep -qE '^127\.0\.0\.'; then
 
         log WARN "Spamhaus ZEN：LISTED"
 
@@ -1213,14 +1479,16 @@ spamhaus_test() {
 }
 
 # ============================================================
-# Tor
+# Tor Exit
 # ============================================================
 
 tor_test() {
 
     section "Tor Exit Node"
 
-    [[ -z "$PUBLIC_IPV4" ]] && return
+    if [[ -z "$PUBLIC_IPV4" ]]; then
+        return
+    fi
 
     local result
 
@@ -1233,7 +1501,7 @@ tor_test() {
     )"
 
     if echo "$result" |
-        grep -qx "$PUBLIC_IPV4"; then
+        grep -Fxq "$PUBLIC_IPV4"; then
 
         log WARN "公网 IP 出现在 Tor Exit Node 列表"
 
@@ -1282,13 +1550,21 @@ risk_score() {
         NETWORK_SCORE=0
 
     if [[ "$NETWORK_SCORE" -ge 90 ]]; then
+
         RISK_LEVEL="低"
+
     elif [[ "$NETWORK_SCORE" -ge 70 ]]; then
+
         RISK_LEVEL="较低"
+
     elif [[ "$NETWORK_SCORE" -ge 50 ]]; then
+
         RISK_LEVEL="中等"
+
     else
+
         RISK_LEVEL="较高"
+
     fi
 
     echo
@@ -1303,6 +1579,121 @@ risk_score() {
 }
 
 # ============================================================
+# JSON报告
+# ============================================================
+
+generate_json() {
+
+    cat > "$REPORT_JSON" <<EOF
+{
+  "version": "${VERSION}",
+  "time": "${START_TIME}",
+  "public_ipv4": "${PUBLIC_IPV4}",
+  "public_ipv6": "${PUBLIC_IPV6}",
+  "local_ipv4": "${LOCAL_IPV4}",
+  "interface": "${DEFAULT_IF}",
+  "gateway": "${DEFAULT_GW}",
+  "dns_server": "${DNS_SERVER}",
+  "target_ip": "${TARGET_IP}",
+  "network_score": ${NETWORK_SCORE},
+  "network_risk": "${RISK_LEVEL}",
+  "spamhaus": "${SPAMHAUS}",
+  "tor_exit": "${TOR_EXIT}",
+  "dns_fail": ${DNS_FAIL},
+  "ping_fail": ${PING_FAIL},
+  "tcp_fail": ${TCP_FAIL},
+  "https_fail": ${HTTPS_FAIL},
+  "tls_fail": ${TLS_FAIL},
+  "cloudflare_speed_mbps": "${CLOUDFLARE_SPEED}",
+  "ovh_speed_mbps": "${OVH_SPEED}",
+  "max_parallel_speed_mbps": "${MAX_PARALLEL_SPEED}"
+}
+EOF
+}
+
+# ============================================================
+# 最终报告
+# ============================================================
+
+final_summary() {
+
+    section "最终测试结果"
+
+    echo
+    echo "公网 IPv4：${PUBLIC_IPV4:-未知}"
+    echo "公网 IPv6：${PUBLIC_IPV6:-无}"
+    echo "本地 IPv4：${LOCAL_IPV4:-未知}"
+    echo "默认网卡：${DEFAULT_IF:-未知}"
+    echo "默认网关：${DEFAULT_GW:-未知}"
+    echo "DNS服务器：${DNS_SERVER:-未知}"
+
+    if [[ -n "$TARGET_IP" ]]; then
+
+        echo "目标 IP：$TARGET_IP"
+
+    else
+
+        echo "目标 IP：未指定"
+
+    fi
+
+    echo
+    echo "------------------------------------------------------------"
+    echo "网络层评分：${NETWORK_SCORE}/100"
+    echo "网络层风险：${RISK_LEVEL}"
+    echo "------------------------------------------------------------"
+
+    echo
+    echo "DNS失败：${DNS_FAIL}"
+    echo "Ping失败：${PING_FAIL}"
+    echo "TCP失败：${TCP_FAIL}"
+    echo "HTTPS失败：${HTTPS_FAIL}"
+    echo "TLS失败：${TLS_FAIL}"
+
+    echo
+    echo "Spamhaus：${SPAMHAUS}"
+    echo "Tor Exit：${TOR_EXIT}"
+
+    echo
+    echo "公网测速："
+    echo "Cloudflare：${CLOUDFLARE_SPEED} Mbps"
+    echo "OVH：${OVH_SPEED} Mbps"
+    echo "最高并发峰值：${MAX_PARALLEL_SPEED}"
+
+    echo
+    echo "TXT报告："
+    echo "$REPORT_TXT"
+
+    echo
+    echo "JSON报告："
+    echo "$REPORT_JSON"
+
+    {
+        echo
+        echo "================ FINAL SUMMARY ================"
+        echo "Public IPv4=${PUBLIC_IPV4}"
+        echo "Public IPv6=${PUBLIC_IPV6}"
+        echo "Local IPv4=${LOCAL_IPV4}"
+        echo "Interface=${DEFAULT_IF}"
+        echo "Gateway=${DEFAULT_GW}"
+        echo "DNS=${DNS_SERVER}"
+        echo "TargetIP=${TARGET_IP}"
+        echo "NetworkScore=${NETWORK_SCORE}"
+        echo "Risk=${RISK_LEVEL}"
+        echo "DNSFail=${DNS_FAIL}"
+        echo "PingFail=${PING_FAIL}"
+        echo "TCPFail=${TCP_FAIL}"
+        echo "HTTPSFail=${HTTPS_FAIL}"
+        echo "TLSFail=${TLS_FAIL}"
+        echo "Spamhaus=${SPAMHAUS}"
+        echo "TorExit=${TOR_EXIT}"
+        echo "CloudflareSpeed=${CLOUDFLARE_SPEED}"
+        echo "OVHSpeed=${OVH_SPEED}"
+        echo "MaxParallelSpeed=${MAX_PARALLEL_SPEED}"
+    } >> "$REPORT_TXT"
+}
+
+# ============================================================
 # 完整测试
 # ============================================================
 
@@ -1312,6 +1703,20 @@ full_test() {
 
     get_public_ip
     network_info
+
+    if [[ -z "$TARGET_IP" ]]; then
+
+        echo
+        read -rp "是否设置 Target IP？[y/N]：" answer
+
+        if [[ "$answer" =~ ^[Yy]$ ]]; then
+
+            input_target_ip || true
+
+        fi
+
+    fi
+
     dns_test
     ping_test
     tcp_test
@@ -1347,12 +1752,16 @@ platform_test() {
 
     create_report
 
+    get_public_ip
+    network_info
+
     section "Google / YouTube / Facebook / TikTok"
 
     dns_test
     tcp_test
     https_test
     tls_test
+    latency_test
 
     final_summary
 
@@ -1369,6 +1778,10 @@ carrier_only_test() {
 
     carrier_test
     mtr_test
+
+    if [[ -n "$TARGET_IP" ]]; then
+        target_test
+    fi
 
     final_summary
 
@@ -1412,102 +1825,6 @@ risk_only_test() {
 }
 
 # ============================================================
-# JSON
-# ============================================================
-
-generate_json() {
-
-    cat > "$REPORT_JSON" <<EOF
-{
-  "version": "${VERSION}",
-  "time": "${START_TIME}",
-  "public_ipv4": "${PUBLIC_IPV4}",
-  "public_ipv6": "${PUBLIC_IPV6}",
-  "local_ipv4": "${LOCAL_IPV4}",
-  "interface": "${DEFAULT_IF}",
-  "gateway": "${DEFAULT_GW}",
-  "target_ip": "${TARGET_IP}",
-  "network_score": ${NETWORK_SCORE},
-  "network_risk": "${RISK_LEVEL}",
-  "spamhaus": "${SPAMHAUS}",
-  "tor_exit": "${TOR_EXIT}",
-  "dns_fail": ${DNS_FAIL},
-  "ping_fail": ${PING_FAIL},
-  "tcp_fail": ${TCP_FAIL},
-  "https_fail": ${HTTPS_FAIL},
-  "tls_fail": ${TLS_FAIL}
-}
-EOF
-}
-
-# ============================================================
-# 最终报告
-# ============================================================
-
-final_summary() {
-
-    section "最终测试结果"
-
-    echo
-    echo "公网 IPv4：${PUBLIC_IPV4:-未知}"
-    echo "公网 IPv6：${PUBLIC_IPV6:-无}"
-    echo "本地 IPv4：${LOCAL_IPV4:-未知}"
-    echo "默认网卡：${DEFAULT_IF:-未知}"
-    echo "默认网关：${DEFAULT_GW:-未知}"
-
-    if [[ -n "$TARGET_IP" ]]; then
-        echo "目标 IP：$TARGET_IP"
-    else
-        echo "目标 IP：未指定"
-    fi
-
-    echo
-    echo "------------------------------------------------------------"
-    echo "网络层评分：${NETWORK_SCORE}/100"
-    echo "网络层风险：${RISK_LEVEL}"
-    echo "------------------------------------------------------------"
-
-    echo
-    echo "DNS失败：${DNS_FAIL}"
-    echo "Ping失败：${PING_FAIL}"
-    echo "TCP失败：${TCP_FAIL}"
-    echo "HTTPS失败：${HTTPS_FAIL}"
-    echo "TLS失败：${TLS_FAIL}"
-
-    echo
-    echo "Spamhaus：${SPAMHAUS}"
-    echo "Tor Exit：${TOR_EXIT}"
-
-    echo
-    echo "TXT报告："
-    echo "$REPORT_TXT"
-
-    echo
-    echo "JSON报告："
-    echo "$REPORT_JSON"
-
-    {
-        echo
-        echo "================ FINAL SUMMARY ================"
-        echo "Public IPv4=${PUBLIC_IPV4}"
-        echo "Public IPv6=${PUBLIC_IPV6}"
-        echo "Local IPv4=${LOCAL_IPV4}"
-        echo "Interface=${DEFAULT_IF}"
-        echo "Gateway=${DEFAULT_GW}"
-        echo "TargetIP=${TARGET_IP}"
-        echo "NetworkScore=${NETWORK_SCORE}"
-        echo "Risk=${RISK_LEVEL}"
-        echo "DNSFail=${DNS_FAIL}"
-        echo "PingFail=${PING_FAIL}"
-        echo "TCPFail=${TCP_FAIL}"
-        echo "HTTPSFail=${HTTPS_FAIL}"
-        echo "TLSFail=${TLS_FAIL}"
-        echo "Spamhaus=${SPAMHAUS}"
-        echo "TorExit=${TOR_EXIT}"
-    } >> "$REPORT_TXT"
-}
-
-# ============================================================
 # 查看公网IP
 # ============================================================
 
@@ -1540,6 +1857,14 @@ show_reports() {
         echo "============================================================"
         echo
 
+        if [[ ! -d "$REPORT_DIR" ]]; then
+
+            echo "暂无报告"
+            pause_screen
+            return
+
+        fi
+
         mapfile -t reports < <(
             find "$REPORT_DIR" \
                 -maxdepth 1 \
@@ -1560,8 +1885,10 @@ show_reports() {
         local i=1
 
         for file in "${reports[@]}"; do
+
             echo "$i. $file"
             ((i++))
+
         done
 
         echo
@@ -1708,10 +2035,12 @@ delete_menu() {
                 ;;
 
             0)
+
                 return
                 ;;
 
             *)
+
                 echo "无效选择"
                 sleep 1
                 ;;
@@ -1765,13 +2094,13 @@ settings_menu() {
                 read -rp "测速时间（秒）： " value
 
                 if [[ "$value" =~ ^[0-9]+$ ]] &&
-                    (( value > 0 )); then
+                    (( value > 0 && value <= 300 )); then
 
                     DURATION="$value"
 
                 else
 
-                    echo "输入无效"
+                    echo "请输入 1-300"
                     sleep 1
 
                 fi
@@ -1801,13 +2130,13 @@ settings_menu() {
                 read -rp "连接超时（秒）： " value
 
                 if [[ "$value" =~ ^[0-9]+$ ]] &&
-                    (( value > 0 )); then
+                    (( value > 0 && value <= 60 )); then
 
                     TIMEOUT="$value"
 
                 else
 
-                    echo "输入无效"
+                    echo "请输入 1-60"
                     sleep 1
 
                 fi
@@ -1848,12 +2177,16 @@ main_menu() {
         print_header
 
         echo
-        echo "当前服务器公网 IP：${PUBLIC_IPV4:-正在获取...}"
+        echo "当前服务器公网 IP：${PUBLIC_IPV4:-未检测}"
 
         if [[ -n "$TARGET_IP" ]]; then
+
             echo "当前目标 IP      ：$TARGET_IP"
+
         else
+
             echo "当前目标 IP      ：未设置"
+
         fi
 
         echo
@@ -1911,10 +2244,13 @@ main_menu() {
             5)
 
                 if input_target_ip; then
+
                     create_report
                     target_test
+                    generate_json
                     final_summary
                     pause_screen
+
                 fi
 
                 ;;
