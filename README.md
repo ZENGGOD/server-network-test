@@ -193,7 +193,7 @@ cd network-test
 下载脚本：
 
 ```bash
-sudo wget https://raw.githubusercontent.com/YOUR_USERNAME/network-test/main/network_test.sh
+sudo wget wget https://raw.githubusercontent.com/ZENGGOD/server-network-test/main/server-network-test.sh
 ```
 
 赋予执行权限：
